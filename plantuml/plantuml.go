@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
-	"strings"
 
 	"go.uber.org/zap"
 
@@ -19,7 +17,7 @@ func Render(input string, format string, log *zap.SugaredLogger) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("running plantuml: %v", err)
 	}
-	output := strings.TrimSuffix(input, path.Ext(input)) + "." + format
+	output := input + "." + format
 	if _, err := os.Stat(output); os.IsNotExist(err) {
 		return "", fmt.Errorf("image file %q not created", output)
 	}

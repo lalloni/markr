@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/hex"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"hash"
+	"io"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/lalloni/markr/inkscape"
@@ -25,6 +29,7 @@ var (
 	inputFile  = flag.String("in", "FILE", "Markdown input file")
 	outputFile = flag.String("out", "FILE", "PDF output file")
 	keep       = flag.Bool("keep", false, "Keep temporal files")
+	nocache    = flag.Bool("nocache", false, "Do not cache generated intermediate results")
 	logger     *zap.Logger
 	log        *zap.SugaredLogger
 	err        error
@@ -61,8 +66,11 @@ func delete(file string) error {
 	return os.Remove(file)
 }
 
+var tempFileCount = make(map[string]int)
+
 func tempFile(kind string) (*os.File, error) {
-	file, err := ioutil.TempFile(os.TempDir(), "markp-"+kind+"-")
+	tempFileCount[kind]++
+	file, err := os.Create(path.Join(os.TempDir(), "markr-"+path.Base(*inputFile)+"-"+kind+"-"+strconv.Itoa(tempFileCount[kind])))
 	deleteOnExit(file.Name())
 	return file, err
 }
@@ -108,6 +116,7 @@ func main() {
 
 	var umlf *os.File
 	var umlw *bufio.Writer
+	var umlh hash.Hash
 	var line, lineprev string
 
 	macro := false
@@ -137,19 +146,29 @@ func main() {
 					log.Errorw("closing temporary file", "error", err)
 					return
 				}
-				svg, err := plantuml.Render(umlf.Name(), "svg", log)
-				if err != nil {
-					log.Errorw("rendering with plantuml", "error", err, "source", umlf.Name())
-					return
+				sha1 := hex.EncodeToString(umlh.Sum(nil))
+				log.Infow("uml source checksum", "sha1", sha1)
+				pdf := umlf.Name() + "-" + sha1 + ".pdf"
+				if _, err := os.Stat(pdf); os.IsNotExist(err) || *nocache {
+					svg, err := plantuml.Render(umlf.Name(), "svg", log)
+					if err != nil {
+						log.Errorw("rendering with plantuml", "error", err, "source", umlf.Name())
+						return
+					}
+					deleteOnExit(svg)
+					err = inkscape.Convert(svg, pdf, log)
+					if err != nil {
+						log.Errorw("converting with inkscape", "error", err, "source", svg)
+						return
+					}
+					if *nocache {
+						deleteOnExit(pdf)
+					} else {
+						log.Infow("caching", "file", pdf)
+					}
+				} else {
+					log.Infow("using cached", "file", pdf)
 				}
-				deleteOnExit(svg)
-				pdf := changeExtension(svg, "pdf")
-				err = inkscape.Convert(svg, pdf, log)
-				if err != nil {
-					log.Errorw("converting with inkscape", "error", err, "source", svg)
-					return
-				}
-				deleteOnExit(pdf)
 				_, err = fmt.Fprintf(mdw, "![](%s)\\ \n", pdf)
 				if err != nil {
 					log.Errorw("writing to output", "error", err)
@@ -183,7 +202,8 @@ func main() {
 					return
 				}
 				log.Infow("macro start", "file", umlf.Name())
-				umlw = bufio.NewWriter(umlf)
+				umlh = sha1.New()
+				umlw = bufio.NewWriter(io.MultiWriter(umlf, umlh))
 				continue
 			}
 			log.Info("copying line to output")
