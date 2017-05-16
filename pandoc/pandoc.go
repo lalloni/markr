@@ -19,6 +19,7 @@ var pandocOptions = []string{
 	"--section-divs",
 	"--standalone",
 	"--self-contained",
+	"-f", "markdown",
 	"-V", "mainfont=Ubuntu",
 	"-V", "monofont=Iosevka",
 	"-V", "papersize=A4",
@@ -26,7 +27,10 @@ var pandocOptions = []string{
 	"-V", "colorlinks",
 	"-V", "toccolor=blue",
 	"-V", "geometry=margin=2cm",
-	"-f", "markdown",
+	"-V", "lang=spanish",
+	"-V", "babel-lang=spanish",
+	"-V", "include-before=\\addto\\captionsspanish{\\renewcommand{\\contentsname}{Contenidos}}",
+	"-V", "include-before=\\renewcommand{\\contentsname}{Contenidos}",
 }
 
 func RenderMarkdown(input string, output string, log *zap.SugaredLogger) error {
