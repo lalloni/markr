@@ -2,122 +2,115 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
+	"io/ioutil"
 	"os"
-	"path"
-	"strconv"
 	"strings"
 
+	"go.uber.org/zap"
+
+	"github.com/lalloni/markr/fileutils"
 	"github.com/lalloni/markr/inkscape"
+	"github.com/lalloni/markr/logging"
+	"github.com/lalloni/markr/options"
 	"github.com/lalloni/markr/pandoc"
 	"github.com/lalloni/markr/plantuml"
-
-	"go.uber.org/zap"
 )
 
 const (
-	MacroBeginDelimiter = "{{"
-	MacroEndDelimiter   = "}}"
+	BeginDelimiter = "{{plantuml"
+	EndDelimiter   = "}}"
 )
-
-var (
-	inputFile  = flag.String("in", "FILE", "Markdown input file")
-	outputFile = flag.String("out", "FILE", "PDF output file")
-	keep       = flag.Bool("keep", false, "Keep temporal files")
-	nocache    = flag.Bool("nocache", false, "Do not cache generated intermediate results")
-	logger     *zap.Logger
-	log        *zap.SugaredLogger
-	err        error
-)
-
-func init() {
-	logger, err = zap.NewDevelopment()
-	if err != nil {
-		panic(err)
-	}
-	log = logger.Sugar()
-}
-
-var deletes []string
-
-func onExitDeletes() {
-	for _, file := range deletes {
-		log.Infow("execute delete on exit", "file", file)
-		delete(file)
-	}
-}
-
-func deleteOnExit(file string) {
-	log.Infow("delete on exit", "file", file)
-	deletes = append(deletes, file)
-}
-
-func delete(file string) error {
-	if *keep {
-		log.Infow("keeping", "file", file)
-		return nil
-	}
-	log.Infow("deleting", "file", file)
-	return os.Remove(file)
-}
-
-var tempFileCount = make(map[string]int)
-
-func tempFile(kind string) (*os.File, error) {
-	tempFileCount[kind]++
-	file, err := os.Create(path.Join(os.TempDir(), "markr-"+path.Base(*inputFile)+"-"+kind+"-"+strconv.Itoa(tempFileCount[kind])))
-	deleteOnExit(file.Name())
-	return file, err
-}
-
-func changeExtension(file string, ext string) string {
-	return strings.TrimSuffix(file, path.Ext(file)) + "." + ext
-}
 
 func isMacroStart(line string) bool {
-	return strings.HasPrefix(line, MacroBeginDelimiter)
+	return strings.HasPrefix(line, BeginDelimiter)
 }
 
 func isMacroEnd(line string) bool {
-	return strings.HasPrefix(line, MacroEndDelimiter)
+	return strings.HasPrefix(line, EndDelimiter)
 }
 
-func isPlantUMLMacroStart(line string) bool {
-	return isMacroStart(line) && strings.HasPrefix(strings.TrimPrefix(line, MacroBeginDelimiter), "plantuml")
+func generatePDF(ctx context.Context, uml io.Reader, diagram string) error {
+	var svg bytes.Buffer
+	err := plantuml.Render(ctx, uml, &svg, "svg")
+	if err != nil {
+		return fmt.Errorf("rendering with plantuml: %v", err)
+	}
+	var pdf bytes.Buffer
+	err = inkscape.ConvertToPDF(ctx, &svg, &pdf)
+	if err != nil {
+		return fmt.Errorf("converting with inkscape: %v", err)
+	}
+	err = ioutil.WriteFile(diagram, pdf.Bytes(), 0600)
+	if err != nil {
+		return fmt.Errorf("writing PDF file: %v", err)
+	}
+	return nil
+}
+
+func generateEPS(ctx context.Context, uml io.Reader, diagram string) error {
+	var eps bytes.Buffer
+	err := plantuml.Render(ctx, uml, &eps, "eps")
+	if err != nil {
+		return fmt.Errorf("rendering with plantuml: %v", err)
+	}
+	err = ioutil.WriteFile(diagram, eps.Bytes(), 0600)
+	if err != nil {
+		return fmt.Errorf("writing PDF file: %v", err)
+	}
+	return nil
 }
 
 func main() {
+	options.ConfigureFlags()
 	flag.Parse()
 
-	logger = logger.WithOptions()
+	ctx := context.Background()
 
-	defer logger.Sync()
-	defer onExitDeletes()
+	ctx = options.WithOptions(ctx)
+	opts := options.Get(ctx)
 
-	inf, err := os.Open(*inputFile)
+	if opts.Usage {
+		flag.Usage()
+		return
+	}
+
+	loggerConfig := zap.NewDevelopmentConfig()
+	loggerConfig.EncoderConfig.EncodeCaller = nil
+	if !opts.Verbose {
+		loggerConfig.Level.SetLevel(zap.ErrorLevel)
+	}
+	logger, err := loggerConfig.Build()
 	if err != nil {
-		log.Errorw("opening file for reading", "file", *inputFile)
+		panic(err)
+	}
+	defer logger.Sync()
+	log := logger.Sugar()
+	ctx = logging.WithZapLogger(ctx, logger)
+
+	defer fileutils.DoDeletes(ctx)
+
+	inf, err := os.Open(opts.InputFile)
+	if err != nil {
+		log.Errorw("opening file for reading", "file", opts.InputFile)
 		return
 	}
 	defer inf.Close()
 
-	mdf, err := tempFile("markdown")
-	if err != nil {
-		log.Errorw("creating temporary markdown file", "error", err)
-		return
-	}
-	defer mdf.Close()
-	mdw := bufio.NewWriter(mdf)
+	var markdown, uml bytes.Buffer
+	var base, line, lineprev string
+	var fixingPlantUML bool
 
-	var umlf *os.File
-	var umlw *bufio.Writer
-	var umlh hash.Hash
-	var line, lineprev string
+	{
+		sha1 := sha1.Sum([]byte(opts.InputFile))
+		base = "markr-" + hex.EncodeToString(sha1[:])
+	}
 
 	macro := false
 	ins := bufio.NewScanner(bufio.NewReader(inf))
@@ -126,107 +119,99 @@ func main() {
 		line = ins.Text()
 		log.Infow("read", "line", line)
 		if macro {
+
 			if isMacroEnd(line) {
+
 				log.Info("macro end")
-				if lineprev[0:1] != "@" {
+
+				if fixingPlantUML {
 					log.Info("generating @enduml marker")
-					_, err := umlw.WriteString("@enduml\n")
+					uml.WriteString("@enduml\n")
+				}
+
+				sha1 := sha1.Sum(uml.Bytes())
+				sha1hex := hex.EncodeToString(sha1[:])
+				log.Infow("uml source checksum", "sha1", sha1hex)
+
+				diagram := fileutils.NewTempFileName(base, "diagram", sha1hex, opts.Diagrams)
+
+				if _, err = os.Stat(diagram); opts.Cache && os.IsNotExist(err) || !opts.Cache {
+
+					switch opts.Diagrams {
+					case "pdf":
+						err = generatePDF(ctx, &uml, diagram)
+					case "eps":
+						err = generateEPS(ctx, &uml, diagram)
+					default:
+						err = fmt.Errorf("unknown diagram format: %q", opts.Diagrams)
+					}
+
 					if err != nil {
-						log.Errorw("writing to temporary file", "error", err)
+						log.Errorw("generating diagram", "error", err, "source", uml.String())
 						return
 					}
-				}
-				err = umlw.Flush()
-				if err != nil {
-					log.Errorw("flushing temporary file", "error", err)
-					return
-				}
-				err = umlf.Close()
-				if err != nil {
-					log.Errorw("closing temporary file", "error", err)
-					return
-				}
-				sha1 := hex.EncodeToString(umlh.Sum(nil))
-				log.Infow("uml source checksum", "sha1", sha1)
-				pdf := umlf.Name() + "-" + sha1 + ".pdf"
-				if _, err := os.Stat(pdf); os.IsNotExist(err) || *nocache {
-					svg, err := plantuml.Render(umlf.Name(), "svg", log)
-					if err != nil {
-						log.Errorw("rendering with plantuml", "error", err, "source", umlf.Name())
-						return
-					}
-					deleteOnExit(svg)
-					err = inkscape.Convert(svg, pdf, log)
-					if err != nil {
-						log.Errorw("converting with inkscape", "error", err, "source", svg)
-						return
-					}
-					if *nocache {
-						deleteOnExit(pdf)
+
+					if !opts.Cache {
+						fileutils.AddDelete(ctx, diagram)
 					} else {
-						log.Infow("caching", "file", pdf)
+						log.Infow("keeping for cache", "file", diagram)
 					}
-				} else {
-					log.Infow("using cached", "file", pdf)
+
 				}
-				_, err = fmt.Fprintf(mdw, "![](%s)\\ \n", pdf)
+
+				log.Infow("using diagram", "file", diagram)
+				_, err = fmt.Fprintf(&markdown, "![](%s)\n", diagram)
 				if err != nil {
 					log.Errorw("writing to output", "error", err)
 					return
 				}
-				umlw = nil
-				umlf = nil
+
+				uml.Reset()
 				macro = false
+				fixingPlantUML = false
+
 			} else {
-				if isPlantUMLMacroStart(lineprev) && line[0:1] != "@" {
+
+				if isMacroStart(lineprev) && line[0:1] != "@" {
 					log.Info("generating @startuml marker")
-					_, err = umlw.WriteString("@startuml\n")
-					if err != nil {
-						log.Errorw("writing to file", "error", err)
-						return
-					}
+					fixingPlantUML = true
+					uml.WriteString("@startuml\n")
 				}
-				log.Infow("copying line to file", "file", umlf.Name())
-				_, err = umlw.WriteString(line + "\n")
-				if err != nil {
-					log.Errorw("writing to file", "file", umlf.Name(), "error", err)
-					return
-				}
+				log.Info("keeping plantuml line")
+				uml.Write([]byte(line))
+				uml.Write([]byte("\n"))
+
 			}
-		} else { // not in macro
-			if isPlantUMLMacroStart(line) {
+
+		} else {
+
+			// not in macro
+
+			if isMacroStart(line) {
+				log.Info("starting plantuml macro")
 				macro = true
-				umlf, err = tempFile("plantuml")
-				if err != nil {
-					log.Errorw("creating temporary file", "error", err)
-					return
-				}
-				log.Infow("macro start", "file", umlf.Name())
-				umlh = sha1.New()
-				umlw = bufio.NewWriter(io.MultiWriter(umlf, umlh))
 				continue
 			}
-			log.Info("copying line to output")
-			_, err = mdw.WriteString(line + "\n")
+
+			log.Info("copying line")
+			_, err = markdown.WriteString(line + "\n")
 			if err != nil {
 				log.Errorw("writing to output", "error", err)
 				return
 			}
+
 		}
 	}
+
 	if ins.Err() != nil {
 		log.Errorw("reading input file", "error", ins.Err())
+		return
 	}
-	if macro {
-		umlw.Flush()
-		umlf.Close()
-	}
-	mdw.Flush()
-	mdf.Close()
-	err = pandoc.RenderMarkdown(mdf.Name(), *outputFile, log)
+
+	err = pandoc.RenderMarkdown(ctx, &markdown, opts.OutputFile)
 	if err != nil {
 		log.Errorw("rendering markdown", "error", err)
 		return
 	}
-	log.Infow("generated pdf file", "file", *outputFile)
+
 }

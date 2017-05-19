@@ -1,25 +1,24 @@
 package plantuml
 
 import (
+	"context"
 	"fmt"
-	"os"
+	"io"
 	"os/exec"
 
-	"go.uber.org/zap"
-
+	"github.com/lalloni/markr/logging"
 	"github.com/lalloni/markr/processes"
 )
 
-func Render(input string, format string, log *zap.SugaredLogger) (string, error) {
-	log.Infow("rendering with plantuml", "input", input, "format", format)
-	cmd := exec.Command("plantuml", "-v", "-t"+format, input)
-	err := processes.RunCommand(cmd, log)
+func Render(ctx context.Context, input io.Reader, output io.Writer, format string) error {
+	log := logging.ZapLogger(ctx)
+	log.Sugar().Infow("rendering with plantuml", "format", format)
+	logger := logging.LoggerWriter(log, "plantuml")
+	defer logger.Close()
+	cmd := exec.Command("plantuml", "-v", "-pipe", "-t"+format)
+	err := processes.Pipe(ctx, cmd, input, output, logger)
 	if err != nil {
-		return "", fmt.Errorf("running plantuml: %v", err)
+		return fmt.Errorf("running plantuml: %v", err)
 	}
-	output := input + "." + format
-	if _, err := os.Stat(output); os.IsNotExist(err) {
-		return "", fmt.Errorf("image file %q not created", output)
-	}
-	return output, nil
+	return nil
 }

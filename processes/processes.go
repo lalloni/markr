@@ -1,41 +1,50 @@
 package processes
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
 
 	"go.uber.org/zap"
+
+	"github.com/lalloni/markr/logging"
 )
 
-func RunCommand(cmd *exec.Cmd, log *zap.SugaredLogger) error {
-	log.Infow("running", "command", cmd.Args)
-	name := cmd.Args[0]
-	o, err := cmd.StdoutPipe()
+func Pipe(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+
+	log := logging.ZapLogger(ctx)
+
+	log.Info("running", zap.Strings("command", cmd.Args))
+
+	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("connecting command %q stdout: %v", name, err)
+		return fmt.Errorf("connecting stdin pipe: %v", err)
 	}
-	defer o.Close()
-	e, err := cmd.StderrPipe()
+	defer stdinPipe.Close()
+	go func() {
+		io.Copy(stdinPipe, stdin)
+		stdinPipe.Close()
+	}()
+
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("connecting command %q stderr: %v", name, err)
+		return fmt.Errorf("connecting stdout pipe: %v", err)
 	}
-	defer e.Close()
-	s := bufio.NewScanner(io.MultiReader(o, e))
-	err = cmd.Start()
+	defer stdoutPipe.Close()
+	go io.Copy(stdout, stdoutPipe)
+
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("starting command %q: %v", name, err)
+		return fmt.Errorf("connecting stderr pipe: %v", err)
 	}
-	for s.Scan() {
-		log.Infof("command %q output: %s", name, s.Text())
-	}
-	if s.Err() != nil {
-		log.Errorf("reading command %q output: %v", name, s.Err())
-	}
-	err = cmd.Wait()
+	defer stderrPipe.Close()
+	go io.Copy(stderr, stderrPipe)
+
+	err = cmd.Run()
 	if err != nil {
-		return fmt.Errorf("waiting command %q exit: %v", name, err)
+		return fmt.Errorf("running command: %v", err)
 	}
+
 	return nil
 }

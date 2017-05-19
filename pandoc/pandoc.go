@@ -1,12 +1,12 @@
 package pandoc
 
 import (
+	"context"
 	"fmt"
-	"os"
+	"io"
 	"os/exec"
 
-	"go.uber.org/zap"
-
+	"github.com/lalloni/markr/logging"
 	"github.com/lalloni/markr/processes"
 )
 
@@ -19,7 +19,8 @@ var pandocOptions = []string{
 	"--section-divs",
 	"--standalone",
 	"--self-contained",
-	"-f", "markdown",
+	"-f", "markdown-implicit_figures",
+	"-t", "latex",
 	"-V", "mainfont=Ubuntu",
 	"-V", "monofont=Iosevka",
 	"-V", "papersize=A4",
@@ -33,16 +34,15 @@ var pandocOptions = []string{
 	"-V", "include-before=\\renewcommand{\\contentsname}{Contenidos}",
 }
 
-func RenderMarkdown(input string, output string, log *zap.SugaredLogger) error {
-	log.Infow("rendering with pandoc", "input", input, "output", output)
-	a := append(pandocOptions, "-o", output, input)
-	cmd := exec.Command("pandoc", a...)
-	err := processes.RunCommand(cmd, log)
+func RenderMarkdown(ctx context.Context, input io.Reader, file string) error {
+	log := logging.ZapLogger(ctx)
+	log.Info("rendering with pandoc")
+	cmd := exec.Command("pandoc", append(pandocOptions, "-o", file)...)
+	logger := logging.LoggerWriter(log, "pandoc")
+	defer logger.Close()
+	err := processes.Pipe(ctx, cmd, input, logger, logger)
 	if err != nil {
 		return fmt.Errorf("running pandoc: %v", err)
-	}
-	if _, err := os.Stat(output); os.IsNotExist(err) {
-		return fmt.Errorf("output file %q not created", output)
 	}
 	return nil
 }
