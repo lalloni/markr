@@ -1,0 +1,15 @@
+hash: d280c85058086d1f171f7eb0cb719de066e795701a7bea3e66a8b957678e672d
+updated: 2017-05-25T19:37:51.26868872-03:00
+imports:
+- name: go.uber.org/atomic
+  version: 4e336646b2ef9fc6e47be8e21594178f98e5ebcf
+- name: go.uber.org/zap
+  version: fab453050a7a08c35f31fc5fff6f2dbd962285ab
+  subpackages:
+  - buffer
+  - internal/bufferpool
+  - internal/color
+  - internal/exit
+  - internal/multierror
+  - zapcore
+testImports: []
